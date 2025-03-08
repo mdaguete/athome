@@ -1,0 +1,40 @@
+# Version control
+.git
+.gitignore
+.github
+
+# Development files
+*.md
+LICENSE
+Makefile
+.editorconfig
+.eslintrc*
+.prettier*
+.env*
+.containerignore
+
+# Dependencies
+frontend/node_modules
+frontend/.npm
+frontend/dist
+
+# Build artifacts
+public/
+athome
+
+# Test files
+*_test.go
+frontend/test
+frontend/__tests__
+frontend/coverage
+
+# IDE and editor files
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
