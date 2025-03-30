@@ -1,3 +1,5 @@
+// Package main implements an enhanced web interface for Bluesky profiles
+// supporting both AppView and PDS authentication modes.
 package main
 
 import (
@@ -16,26 +18,42 @@ import (
 	"github.com/bluesky-social/indigo/xrpc"
 )
 
+// defaultDirectory implements the identity.Directory interface by wrapping
+// the default Bluesky directory service. It provides handle resolution and
+// DID lookup capabilities.
 type defaultDirectory struct {
 	dir identity.Directory
 }
 
+// LookupHandle resolves a Bluesky handle to its corresponding identity.
+// This is used to convert user handles to DIDs for API operations.
 func (d *defaultDirectory) LookupHandle(ctx context.Context, handle syntax.Handle) (*identity.Identity, error) {
 	return d.dir.LookupHandle(ctx, handle)
 }
 
+// Lookup resolves an AT identifier (handle or DID) to its corresponding identity.
 func (d *defaultDirectory) Lookup(ctx context.Context, did syntax.AtIdentifier) (*identity.Identity, error) {
 	return d.dir.Lookup(ctx, did)
 }
 
+// LookupDID resolves a DID to its corresponding identity.
 func (d *defaultDirectory) LookupDID(ctx context.Context, did syntax.DID) (*identity.Identity, error) {
 	return d.dir.LookupDID(ctx, did)
 }
 
+// Purge removes an identity from the directory cache.
 func (d *defaultDirectory) Purge(ctx context.Context, did syntax.AtIdentifier) error {
 	return d.dir.Purge(ctx, did)
 }
 
+// getEnvOrFlag retrieves a configuration value from either an environment variable
+// or a command-line flag, prioritizing the environment variable if present.
+//
+// Parameters:
+//   - envKey: The environment variable name
+//   - flagValue: The command-line flag value
+//
+// Returns the environment variable value if set, otherwise the flag value.
 func getEnvOrFlag(envKey, flagValue string) string {
 	if env := os.Getenv(envKey); env != "" {
 		return env
@@ -43,6 +61,14 @@ func getEnvOrFlag(envKey, flagValue string) string {
 	return flagValue
 }
 
+// getEnvListOrFlag retrieves a comma-separated list from either an environment variable
+// or a command-line flag, splitting it into a slice of strings.
+//
+// Parameters:
+//   - envKey: The environment variable name
+//   - flagValue: The command-line flag value
+//
+// Returns a slice of strings, or nil if both sources are empty.
 func getEnvListOrFlag(envKey string, flagValue string) []string {
 	if env := os.Getenv(envKey); env != "" {
 		return strings.Split(env, ",")
@@ -53,6 +79,14 @@ func getEnvListOrFlag(envKey string, flagValue string) []string {
 	return strings.Split(flagValue, ",")
 }
 
+// isValidHandle checks if a given handle is in the list of valid handles.
+// If the validHandles list is empty, all handles are considered valid.
+//
+// Parameters:
+//   - handle: The handle to validate
+//   - validHandles: List of allowed handles
+//
+// Returns true if the handle is valid, false otherwise.
 func isValidHandle(handle string, validHandles []string) bool {
 	if len(validHandles) == 0 {
 		return true
@@ -65,6 +99,18 @@ func isValidHandle(handle string, validHandles []string) bool {
 	return false
 }
 
+// Run initializes and starts the server with the provided configuration.
+// It handles server setup and lifecycle management.
+//
+// Parameters:
+//   - ctx: Context for lifecycle management
+//   - bindAddr: Server bind address
+//   - xrpcc: XRPC client for API communication
+//   - dir: Identity directory service
+//   - validHandles: List of allowed handles
+//   - auth: Optional PDS authentication configuration
+//
+// Returns an error if server setup or operation fails.
 func Run(ctx context.Context, bindAddr string, xrpcc *xrpc.Client, dir identity.Directory, validHandles []string, auth *AuthConfig) error {
 	// Create and set up server
 	srv, err := setupServer(bindAddr, xrpcc, dir, validHandles, auth)
@@ -76,6 +122,8 @@ func Run(ctx context.Context, bindAddr string, xrpcc *xrpc.Client, dir identity.
 	return startServer(ctx, srv, bindAddr)
 }
 
+// main is the entry point of the application. It handles configuration loading,
+// server setup, and graceful shutdown.
 func main() {
 	var bindAddr string
 	var appviewHost string
@@ -84,6 +132,7 @@ func main() {
 	var pdsHandle string
 	var pdsPassword string
 
+	// Parse command line flags
 	flag.StringVar(&bindAddr, "bind", ":8200", "address to bind server to")
 	flag.StringVar(&appviewHost, "appview", "https://api.bsky.app", "appview host to connect to")
 	flag.StringVar(&validHandles, "valid-handles", "", "comma-separated list of valid handles")

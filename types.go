@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/indigo/atproto/identity"
@@ -15,6 +16,7 @@ type Server struct {
 	dir          identity.Directory
 	validHandles []string
 	auth         *AuthConfig
+	authMutex    sync.RWMutex // Protects auth token refresh operations
 }
 
 // AuthConfig manages PDS authentication and token refresh
