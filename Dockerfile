@@ -64,7 +64,10 @@ LABEL org.opencontainers.image.version="1.0.0"
 EXPOSE 8200
 ENV ATHOME_BIND=:8200 \
     ATHOME_APPVIEW=https://api.bsky.app \
-    ATHOME_VALID_HANDLES=""
+    ATHOME_VALID_HANDLES="" \
+    ATHOME_PDS="" \
+    ATHOME_PDS_HANDLE="" \
+    ATHOME_PDS_PASSWORD=""
 
 WORKDIR /usr/local/bin
 

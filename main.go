@@ -65,9 +65,9 @@ func isValidHandle(handle string, validHandles []string) bool {
 	return false
 }
 
-func Run(ctx context.Context, bindAddr string, xrpcc *xrpc.Client, dir identity.Directory, validHandles []string) error {
+func Run(ctx context.Context, bindAddr string, xrpcc *xrpc.Client, dir identity.Directory, validHandles []string, auth *AuthConfig) error {
 	// Create and set up server
-	srv, err := setupServer(bindAddr, xrpcc, dir, validHandles)
+	srv, err := setupServer(bindAddr, xrpcc, dir, validHandles, auth)
 	if err != nil {
 		return fmt.Errorf("failed to set up server: %w", err)
 	}
@@ -80,16 +80,25 @@ func main() {
 	var bindAddr string
 	var appviewHost string
 	var validHandles string
-	
+	var pdsHost string
+	var pdsHandle string
+	var pdsPassword string
+
 	flag.StringVar(&bindAddr, "bind", ":8200", "address to bind server to")
 	flag.StringVar(&appviewHost, "appview", "https://api.bsky.app", "appview host to connect to")
 	flag.StringVar(&validHandles, "valid-handles", "", "comma-separated list of valid handles")
+	flag.StringVar(&pdsHost, "pds", "", "PDS host to connect to")
+	flag.StringVar(&pdsHandle, "pds-handle", "", "handle to authenticate with PDS")
+	flag.StringVar(&pdsPassword, "pds-password", "", "password to authenticate with PDS")
 	flag.Parse()
 
 	// Override flags with environment variables if present
 	bindAddr = getEnvOrFlag("ATHOME_BIND", bindAddr)
 	appviewHost = getEnvOrFlag("ATHOME_APPVIEW", appviewHost)
 	validHandlesList := getEnvListOrFlag("ATHOME_VALID_HANDLES", validHandles)
+	pdsHost = getEnvOrFlag("ATHOME_PDS", pdsHost)
+	pdsHandle = getEnvOrFlag("ATHOME_PDS_HANDLE", pdsHandle)
+	pdsPassword = getEnvOrFlag("ATHOME_PDS_PASSWORD", pdsPassword)
 
 	// Set up logging
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -97,10 +106,46 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	// Create XRPC client
-	xrpcc := &xrpc.Client{
-		Client: util.RobustHTTPClient(),
-		Host:   appviewHost,
+	// Validate configuration exclusivity
+	isPDSConfigured := pdsHost != ""
+	isAppViewConfigured := appviewHost != "https://api.bsky.app" // Check if non-default
+	if isPDSConfigured && isAppViewConfigured {
+		slog.Error("configuration error: cannot use both PDS and AppView configurations")
+		os.Exit(1)
+	}
+
+	// Create XRPC client based on configuration
+	var xrpcc *xrpc.Client
+	var auth *AuthConfig
+
+	if isPDSConfigured {
+		if pdsHandle == "" || pdsPassword == "" {
+			slog.Error("PDS host specified but missing handle or password")
+			os.Exit(1)
+		}
+
+		// When using PDS, create both XRPC client and auth config
+		xrpcc = &xrpc.Client{
+			Client: util.RobustHTTPClient(),
+			Host:   pdsHost,
+		}
+
+		// Create auth config for token management
+		auth = &AuthConfig{
+			PDS:      pdsHost,
+			Handle:   pdsHandle,
+			Password: pdsPassword,
+		}
+
+		slog.Info("using PDS configuration", "host", pdsHost)
+	} else {
+		// When using AppView, only create XRPC client
+		xrpcc = &xrpc.Client{
+			Client: util.RobustHTTPClient(),
+			Host:   appviewHost,
+		}
+
+		slog.Info("using AppView configuration", "host", appviewHost)
 	}
 
 	// Set up context with cancellation
@@ -122,8 +167,13 @@ func main() {
 	}
 
 	// Run server
-	slog.Info("starting server", "bind", bindAddr)
-	if err := Run(ctx, bindAddr, xrpcc, dir, validHandlesList); err != nil {
+	slog.Info("starting server",
+		"bind", bindAddr,
+		"host", xrpcc.Host,
+		"auth_enabled", auth != nil,
+	)
+
+	if err := Run(ctx, bindAddr, xrpcc, dir, validHandlesList, auth); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}

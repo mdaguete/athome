@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -14,13 +15,6 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 )
 
-type Server struct {
-	e            *echo.Echo
-	xrpcc        *xrpc.Client
-	dir          identity.Directory
-	validHandles []string
-}
-
 // generateNonce creates a random nonce for CSP
 func generateNonce() string {
 	b := make([]byte, 16)
@@ -28,7 +22,7 @@ func generateNonce() string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-func setupServer(bindAddr string, xrpcc *xrpc.Client, dir identity.Directory, validHandles []string) (*Server, error) {
+func setupServer(bindAddr string, xrpcClient *xrpc.Client, dir identity.Directory, validHandles []string, authConfig *AuthConfig) (*Server, error) {
 	e := echo.New()
 	e.HideBanner = true
 
@@ -38,11 +32,11 @@ func setupServer(bindAddr string, xrpcc *xrpc.Client, dir identity.Directory, va
 		ContentTypeNosniff: "nosniff",
 		XFrameOptions:      "SAMEORIGIN",
 		HSTSMaxAge:         31536000,
-		ContentSecurityPolicy: `default-src 'self'; 
-			script-src 'self' 'nonce-{nonce}'; 
-			style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; 
-			font-src 'self' https://fonts.gstatic.com; 
-			img-src 'self' data: https:; 
+		ContentSecurityPolicy: `default-src 'self';
+			script-src 'self' 'nonce-{nonce}';
+			style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+			font-src 'self' https://fonts.gstatic.com;
+			img-src 'self' data: https:;
 			connect-src 'self' https://api.bsky.app;
 			manifest-src 'self';
 			worker-src 'self'`,
@@ -71,9 +65,32 @@ func setupServer(bindAddr string, xrpcc *xrpc.Client, dir identity.Directory, va
 	// Create server instance
 	srv := &Server{
 		e:            e,
-		xrpcc:        xrpcc,
+		xrpcc:        xrpcClient,
 		dir:          dir,
 		validHandles: validHandles,
+		auth:         authConfig,
+	}
+
+	// Add server to context for middleware
+	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			c.Set("server", srv)
+			return next(c)
+		}
+	})
+
+	// Add auth refresh middleware if auth is configured
+	if authConfig != nil {
+		e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				srv := c.Get("server").(*Server)
+				if err := srv.refreshAuth(c); err != nil {
+					slog.Error("failed to refresh auth", "error", err)
+					return echo.NewHTTPError(http.StatusUnauthorized, "authentication failed")
+				}
+				return next(c)
+			}
+		})
 	}
 
 	// Health check
