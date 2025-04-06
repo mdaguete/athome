@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/xrpc"
 	"github.com/labstack/echo/v4"
@@ -112,12 +114,77 @@ func setupServer(bindAddr string, xrpcClient *xrpc.Client, dir identity.Director
 
 	// Configure authentication refresh middleware when using PDS
 	if authConfig != nil {
+		// Create a context for background refresh that will be cancelled when server stops
+		refreshCtx, refreshCancel := context.WithCancel(context.Background())
+		srv.refreshCancel = refreshCancel
+
+		// Start background token refresh
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-refreshCtx.Done():
+					slog.Info("stopping background token refresh")
+					return
+				case <-ticker.C:
+					// Check if we need to refresh
+					srv.authMutex.RLock()
+					needsRefresh := srv.auth.RefreshAt.IsZero() || time.Now().After(srv.auth.RefreshAt.Add(-10*time.Minute))
+					srv.authMutex.RUnlock()
+
+					if needsRefresh {
+						// Create a new session directly
+						session, err := atproto.ServerCreateSession(refreshCtx, srv.xrpcc, &atproto.ServerCreateSession_Input{
+							Identifier: srv.auth.Handle,
+							Password:   srv.auth.Password,
+						})
+						if err != nil {
+							slog.Error("background token refresh failed", "error", err)
+							continue
+						}
+
+						// Update token info under lock
+						srv.authMutex.Lock()
+						srv.auth.Token = session.AccessJwt
+						srv.auth.RefreshAt = time.Now().Add(time.Hour * 23) // Refresh 1 hour before expiry
+						srv.xrpcc.Auth = &xrpc.AuthInfo{AccessJwt: session.AccessJwt}
+						srv.authMutex.Unlock()
+
+						slog.Info("background token refresh successful")
+					}
+				}
+			}
+		}()
+
+		// Also keep the request middleware for immediate refresh if needed
 		e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
 			return func(c echo.Context) error {
 				srv := c.Get("server").(*Server)
-				if err := srv.refreshAuth(c); err != nil {
-					slog.Error("failed to refresh auth", "error", err)
-					return echo.NewHTTPError(http.StatusUnauthorized, "authentication failed")
+
+				// Check if we need to refresh
+				srv.authMutex.RLock()
+				needsRefresh := srv.auth.RefreshAt.IsZero() || time.Now().After(srv.auth.RefreshAt.Add(-10*time.Minute))
+				srv.authMutex.RUnlock()
+
+				if needsRefresh {
+					// Create a new session directly
+					session, err := atproto.ServerCreateSession(c.Request().Context(), srv.xrpcc, &atproto.ServerCreateSession_Input{
+						Identifier: srv.auth.Handle,
+						Password:   srv.auth.Password,
+					})
+					if err != nil {
+						slog.Error("failed to refresh auth", "error", err)
+						return echo.NewHTTPError(http.StatusUnauthorized, "authentication failed")
+					}
+
+					// Update token info under lock
+					srv.authMutex.Lock()
+					srv.auth.Token = session.AccessJwt
+					srv.auth.RefreshAt = time.Now().Add(time.Hour * 23) // Refresh 1 hour before expiry
+					srv.xrpcc.Auth = &xrpc.AuthInfo{AccessJwt: session.AccessJwt}
+					srv.authMutex.Unlock()
 				}
 				return next(c)
 			}
@@ -184,12 +251,21 @@ func startServer(ctx context.Context, srv *Server, bindAddr string) error {
 	// Wait for shutdown signal or error
 	select {
 	case <-ctx.Done():
+		// Cancel background refresh if it's running
+		if srv.refreshCancel != nil {
+			srv.refreshCancel()
+		}
+
 		// Attempt graceful shutdown
 		if err := srv.e.Shutdown(context.Background()); err != nil {
 			return fmt.Errorf("failed to shutdown server: %w", err)
 		}
 		return nil
 	case err := <-errChan:
+		// Cancel background refresh on error
+		if srv.refreshCancel != nil {
+			srv.refreshCancel()
+		}
 		return err
 	}
 }

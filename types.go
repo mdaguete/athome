@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -11,12 +12,13 @@ import (
 
 // Server represents the main application server
 type Server struct {
-	e            *echo.Echo
-	xrpcc        *xrpc.Client
-	dir          identity.Directory
-	validHandles []string
-	auth         *AuthConfig
-	authMutex    sync.RWMutex // Protects auth token refresh operations
+	e             *echo.Echo
+	xrpcc         *xrpc.Client
+	dir           identity.Directory
+	validHandles  []string
+	auth          *AuthConfig
+	authMutex     sync.RWMutex       // Protects auth token refresh operations
+	refreshCancel context.CancelFunc // For cancelling background token refresh
 }
 
 // AuthConfig manages PDS authentication and token refresh
