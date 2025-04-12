@@ -14,7 +14,7 @@ export class BlueskyClient {
 
         // Set up infinite scroll
         this.setupInfiniteScroll();
-        
+
         // Handle URL changes
         window.addEventListener('popstate', () => this.handleUrlChange());
         this.handleUrlChange();
@@ -41,6 +41,11 @@ export class BlueskyClient {
         });
     }
 
+    async initialize(handle) {
+        this.currentHandle = handle;
+        await this.handleUrlChange();
+    }
+
     setupInfiniteScroll() {
         // Create intersection observer for infinite scroll
         this.observer = new IntersectionObserver(
@@ -61,7 +66,7 @@ export class BlueskyClient {
             const params = new URLSearchParams(url.search);
             let handle = params.get('handle');
             const postUri = params.get('post');
-            
+
             if (!handle) {
                 // Get default handle from HTML data attribute
                 handle = document.documentElement.getAttribute('data-default-handle');
@@ -70,18 +75,18 @@ export class BlueskyClient {
                 newUrl.searchParams.set('handle', handle);
                 window.history.pushState({}, '', newUrl);
             }
-            
+
             if (handle !== this.currentHandle) {
                 // Reset state for new handle
                 this.currentHandle = handle;
                 this.cursor = null;
                 this.feedContainer.innerHTML = '';
-                
+
                 // Disconnect any existing observers
                 if (this.observer) {
                     this.observer.disconnect();
                 }
-                
+
                 await this.loadProfile();
                 await this.loadMorePosts();
             }
@@ -100,12 +105,12 @@ export class BlueskyClient {
         const errorElement = document.createElement('div');
         errorElement.className = 'error-message';
         errorElement.textContent = message;
-        
+
         // Add error to feed container
         if (this.feedContainer) {
             this.feedContainer.insertBefore(errorElement, this.feedContainer.firstChild);
         }
-        
+
         // Auto-hide after 5 seconds
         setTimeout(() => {
             errorElement.remove();
@@ -174,7 +179,7 @@ export class BlueskyClient {
         } catch (error) {
             console.error('Error loading profile:', error);
             this.showError('Failed to load profile. Please try again later.');
-            
+
             // Clear profile container and show minimal error state
             this.profileContainer.innerHTML = '';
             const errorHeader = document.createElement('h1');
@@ -186,28 +191,34 @@ export class BlueskyClient {
 
     async loadMorePosts() {
         if (this.isLoading) return;
-        
+
         this.isLoading = true;
         this.loadingSpinner.style.display = 'block';
 
         try {
             const data = await this.api.getFeed(this.currentHandle, this.cursor);
-            
-            // If we get posts, update cursor and add them
-            if (data.posts && data.posts.length > 0) {
+
+            // If we get feed items, update cursor and add them
+            if (data.feed && data.feed.length > 0) {
                 this.cursor = data.cursor;
-                data.posts.forEach(post => {
+                data.feed.forEach(post => {
                     const postElement = this.createPostElement(post);
-                    this.feedContainer.appendChild(postElement);
-                    
-                    // Only observe the last post if we have a cursor for more posts
-                    if (post === data.posts[data.posts.length - 1] && this.cursor) {
-                        this.observer.observe(postElement);
+                    if (postElement) {
+                        this.feedContainer.appendChild(postElement);
                     }
                 });
-            } else {
-                // No more posts to load
-                this.cursor = null;
+
+                // Observe the last post for infinite scroll
+                const lastPost = this.feedContainer.lastElementChild;
+                if (lastPost && this.observer) {
+                    this.observer.observe(lastPost);
+                }
+            } else if (!this.cursor) {
+                // If this is the first load and no posts, show message
+                const noPostsMessage = document.createElement('div');
+                noPostsMessage.className = 'no-posts-message';
+                noPostsMessage.textContent = 'No posts found';
+                this.feedContainer.appendChild(noPostsMessage);
             }
         } catch (error) {
             console.error('Error loading posts:', error);
@@ -218,10 +229,12 @@ export class BlueskyClient {
         }
     }
 
-    createPostElement(post) {
+    createPostElement(feedItem) {
+        if (!feedItem || !feedItem.post) return null;
+
+        const post = feedItem.post;
         const postElement = document.createElement('article');
         postElement.className = 'post';
-
 
         // Add date if available
         let dateInfo = null;
@@ -230,15 +243,13 @@ export class BlueskyClient {
             dateInfo.className = 'post-date-botton';
             const date = new Date(post.indexedAt);
             dateInfo.title = date.toLocaleString(); // Full date on hover
-            dateInfo.textContent = this.formatDate(date);
+            dateInfo.textContent = this.formatDate(post.indexedAt);
         }
-
-
 
         const content = document.createElement('div');
         content.className = 'post-content';
 
-        // Images are in embed.images
+        // Add images if present
         if (post.embed && post.embed.images && post.embed.images.length > 0) {
             const imageGrid = document.createElement('div');
             imageGrid.className = 'post-image-grid';
@@ -266,7 +277,7 @@ export class BlueskyClient {
             content.appendChild(imageGrid);
         }
 
-        // Text is in record.text
+        // Add text content if present
         if (post.record && post.record.text) {
             const text = document.createElement('div');
             text.className = 'post-text';
@@ -275,7 +286,9 @@ export class BlueskyClient {
         }
 
         postElement.appendChild(content);
-        postElement.appendChild(dateInfo);
+        if (dateInfo) {
+            postElement.appendChild(dateInfo);
+        }
 
         // Add click handler for post detail view
         postElement.addEventListener('click', () => {
@@ -387,7 +400,7 @@ export class BlueskyClient {
             console.log('Post data on detail:', post);
             const detailContent = document.createElement('div');
             detailContent.className = 'post-detail';
-            
+
             // Add close button
             const closeButton = document.createElement('button');
             closeButton.className = 'close-button';
@@ -439,8 +452,12 @@ export class BlueskyClient {
         }
     }
 
-    // Helper function to format dates in a user-friendly way
-    formatDate(date) {
+    formatDate(dateStr) {
+        if (!dateStr) return '';
+
+        const date = new Date(dateStr);
+        if (isNaN(date.getTime())) return ''; // Return empty string if invalid date
+
         const now = new Date();
         const diff = now - date;
         const seconds = Math.floor(diff / 1000);

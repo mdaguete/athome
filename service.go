@@ -129,30 +129,85 @@ func setupServer(bindAddr string, xrpcClient *xrpc.Client, dir identity.Director
 					slog.Info("stopping background token refresh")
 					return
 				case <-ticker.C:
+					// Log that we're checking token expiry
+					slog.Info("background refresh: checking if token needs refresh")
+
 					// Check if we need to refresh
 					srv.authMutex.RLock()
-					needsRefresh := srv.auth.RefreshAt.IsZero() || time.Now().After(srv.auth.RefreshAt.Add(-10*time.Minute))
+					tokenExpired := srv.auth.RefreshAt.IsZero() || time.Now().After(srv.auth.RefreshAt.Add(-30*time.Minute))
+					slog.Info("background refresh: token expiry check result",
+						"token_expired", tokenExpired,
+						"refresh_at", srv.auth.RefreshAt,
+						"now", time.Now(),
+						"time_until_refresh", srv.auth.RefreshAt.Sub(time.Now()))
 					srv.authMutex.RUnlock()
 
-					if needsRefresh {
-						// Create a new session directly
-						session, err := atproto.ServerCreateSession(refreshCtx, srv.xrpcc, &atproto.ServerCreateSession_Input{
-							Identifier: srv.auth.Handle,
-							Password:   srv.auth.Password,
-						})
-						if err != nil {
-							slog.Error("background token refresh failed", "error", err)
-							continue
+					if !tokenExpired {
+						slog.Info("background refresh: token is still valid, no refresh needed")
+					} else {
+						// Try to refresh using the refresh token first
+						srv.authMutex.RLock()
+						hasRefreshToken := srv.auth.RefreshToken != ""
+						refreshToken := srv.auth.RefreshToken
+						srv.authMutex.RUnlock()
+
+						var newAccessToken, newRefreshToken string
+						var refreshSuccess bool
+
+						if hasRefreshToken {
+							slog.Info("background refresh: attempting to use refresh token")
+
+							// Save the current auth info
+							tempAuth := srv.xrpcc.Auth
+
+							// Set the refresh token in the Auth field
+							srv.xrpcc.Auth = &xrpc.AuthInfo{RefreshJwt: refreshToken}
+
+							// Try to refresh the session
+							refreshedSession, err := atproto.ServerRefreshSession(refreshCtx, srv.xrpcc)
+
+							// Restore the original auth
+							srv.xrpcc.Auth = tempAuth
+
+							if err == nil {
+								newAccessToken = refreshedSession.AccessJwt
+								newRefreshToken = refreshedSession.RefreshJwt
+								refreshSuccess = true
+								slog.Info("background refresh: successfully refreshed using refresh token")
+							} else {
+								slog.Error("background refresh: failed to refresh using token, falling back to password auth", "error", err)
+							}
+						}
+
+						// If refresh token didn't work or isn't available, create a new session
+						if !refreshSuccess {
+							slog.Info("background refresh: creating new session")
+							session, err := atproto.ServerCreateSession(refreshCtx, srv.xrpcc, &atproto.ServerCreateSession_Input{
+								Identifier: srv.auth.Handle,
+								Password:   srv.auth.Password,
+							})
+							if err != nil {
+								slog.Error("background refresh: failed to create new session", "error", err)
+								continue
+							}
+
+							newAccessToken = session.AccessJwt
+							newRefreshToken = session.RefreshJwt
+							slog.Info("background refresh: successfully created new session")
 						}
 
 						// Update token info under lock
 						srv.authMutex.Lock()
-						srv.auth.Token = session.AccessJwt
-						srv.auth.RefreshAt = time.Now().Add(time.Hour * 23) // Refresh 1 hour before expiry
-						srv.xrpcc.Auth = &xrpc.AuthInfo{AccessJwt: session.AccessJwt}
+						srv.auth.Token = newAccessToken
+						srv.auth.RefreshToken = newRefreshToken
+						// Set refresh time to 1 hour before the assumed 24-hour expiry
+						srv.auth.RefreshAt = time.Now().Add(time.Hour * 23)
+						srv.xrpcc.Auth = &xrpc.AuthInfo{AccessJwt: newAccessToken}
 						srv.authMutex.Unlock()
 
-						slog.Info("background token refresh successful")
+						slog.Info("background token refresh completed successfully",
+							"refresh_at", srv.auth.RefreshAt,
+							"refresh_in", srv.auth.RefreshAt.Sub(time.Now()))
 					}
 				}
 			}
@@ -163,28 +218,28 @@ func setupServer(bindAddr string, xrpcClient *xrpc.Client, dir identity.Director
 			return func(c echo.Context) error {
 				srv := c.Get("server").(*Server)
 
+				// Log that we're checking token expiry
+				slog.Info("request middleware: checking if token needs refresh")
+
 				// Check if we need to refresh
 				srv.authMutex.RLock()
-				needsRefresh := srv.auth.RefreshAt.IsZero() || time.Now().After(srv.auth.RefreshAt.Add(-10*time.Minute))
+				tokenExpired := srv.auth.RefreshAt.IsZero() || time.Now().After(srv.auth.RefreshAt.Add(-30*time.Minute))
+				slog.Info("request middleware: token expiry check result",
+					"token_expired", tokenExpired,
+					"refresh_at", srv.auth.RefreshAt,
+					"now", time.Now(),
+					"time_until_refresh", srv.auth.RefreshAt.Sub(time.Now()))
 				srv.authMutex.RUnlock()
 
-				if needsRefresh {
-					// Create a new session directly
-					session, err := atproto.ServerCreateSession(c.Request().Context(), srv.xrpcc, &atproto.ServerCreateSession_Input{
-						Identifier: srv.auth.Handle,
-						Password:   srv.auth.Password,
-					})
-					if err != nil {
-						slog.Error("failed to refresh auth", "error", err)
+				if !tokenExpired {
+					slog.Info("request middleware: token is still valid, no refresh needed")
+				} else {
+					// Use the server's refreshAuth method to handle token refresh
+					// This ensures consistent refresh logic between background and request-based refresh
+					if err := srv.refreshAuth(c); err != nil {
+						slog.Error("failed to refresh auth in middleware", "error", err)
 						return echo.NewHTTPError(http.StatusUnauthorized, "authentication failed")
 					}
-
-					// Update token info under lock
-					srv.authMutex.Lock()
-					srv.auth.Token = session.AccessJwt
-					srv.auth.RefreshAt = time.Now().Add(time.Hour * 23) // Refresh 1 hour before expiry
-					srv.xrpcc.Auth = &xrpc.AuthInfo{AccessJwt: session.AccessJwt}
-					srv.authMutex.Unlock()
 				}
 				return next(c)
 			}
@@ -205,6 +260,11 @@ func setupServer(bindAddr string, xrpcClient *xrpc.Client, dir identity.Director
 		// Hostname-based routes (handle derived from hostname)
 		api.GET("/profile", srv.handleGetProfile)
 		api.GET("/feed", srv.handleGetFeed)
+
+		// Portfolio routes
+		api.GET("/portfolio-config", srv.handleGetPortfolioConfig) // Get portfolio configuration
+		api.GET("/portfolio/:handle", srv.handleGetPortfolio)      // Get portfolio by handle
+		api.GET("/portfolio", srv.handleGetPortfolio)              // Get portfolio (handle from hostname)
 	}
 
 	// SPA routes - serve index.html for client-side routing
