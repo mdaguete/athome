@@ -94,6 +94,25 @@ async function loadPortfolio(handle) {
 
 // Initialize the app
 async function initializeApp() {
+  // Check if portfolio feature is enabled
+  try {
+    const config = await api.getPortfolioConfig();
+    if (!config.enabled) {
+      // Hide the portfolio tab if the feature is not enabled
+      const portfolioLink = document.querySelector('.nav-link[data-section="portfolio"]');
+      if (portfolioLink) {
+        portfolioLink.style.display = 'none';
+      }
+    }
+  } catch (error) {
+    console.error('Error checking portfolio config:', error);
+    // Hide the portfolio tab if there's an error checking the config
+    const portfolioLink = document.querySelector('.nav-link[data-section="portfolio"]');
+    if (portfolioLink) {
+      portfolioLink.style.display = 'none';
+    }
+  }
+
   initializeNavigation();
   await client.initialize(defaultHandle);
 }
