@@ -6,12 +6,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/atproto/syntax"
-	"github.com/bluesky-social/indigo/xrpc"
 	"github.com/labstack/echo/v4"
 )
 
@@ -128,6 +125,12 @@ func (srv *Server) handleGetProfile(c echo.Context) error {
 		return err
 	}
 
+	// Ensure we have a valid token before making the API request
+	if err := srv.ensureValidToken(c); err != nil {
+		slog.Error("failed to ensure valid token", "error", err)
+		return echo.NewHTTPError(http.StatusInternalServerError, "Authentication error: "+err.Error())
+	}
+
 	// Get profile using DID
 	profile, err := bsky.ActorGetProfile(c.Request().Context(), srv.xrpcc, did)
 	if err != nil {
@@ -173,6 +176,12 @@ func (srv *Server) handleGetFeed(c echo.Context) error {
 	did, err := srv.validateAndGetDID(c, handle)
 	if err != nil {
 		return err
+	}
+
+	// Ensure we have a valid token before making the API request
+	if err := srv.ensureValidToken(c); err != nil {
+		slog.Error("failed to ensure valid token", "error", err)
+		return echo.NewHTTPError(http.StatusInternalServerError, "Authentication error: "+err.Error())
 	}
 
 	cursor := c.QueryParam("cursor")
@@ -240,6 +249,12 @@ func (srv *Server) handleGetPost(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid uri format")
 	}
 
+	// Ensure we have a valid token before making the API request
+	if err := srv.ensureValidToken(c); err != nil {
+		slog.Error("failed to ensure valid token", "error", err)
+		return echo.NewHTTPError(http.StatusInternalServerError, "Authentication error: "+err.Error())
+	}
+
 	// Get thread with depth 8 for context
 	thread, err := bsky.FeedGetPostThread(c.Request().Context(), srv.xrpcc, 8, 0, atUri.String())
 	if err != nil {
@@ -292,69 +307,73 @@ func (srv *Server) handleIndex(c echo.Context) error {
 	return c.HTMLBlob(http.StatusOK, []byte(modifiedContent))
 }
 
-// refreshAuth handles PDS authentication token refresh.
-// It checks if the current token needs refresh and obtains a new one
-// if necessary. This is used by the auth middleware when PDS mode is enabled.
-// The function uses a read-write mutex to prevent concurrent token refreshes
-// while allowing multiple requests to use the same token.
-//
-// Parameters:
-//   - c: The Echo context
-//
-// Returns:
-//   - nil if refresh successful or not needed
-//   - error if refresh fails or no auth config is present
-func (srv *Server) refreshAuth(c echo.Context) error {
-	if srv.auth == nil {
-		return fmt.Errorf("no auth configuration")
+// Portfolio represents a user's portfolio data
+type Portfolio struct {
+	Handle      string    `json:"handle"`
+	Description string    `json:"description"`
+	Projects    []Project `json:"projects"`
+}
+
+// Project represents a portfolio project
+type Project struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	URL         string `json:"url,omitempty"`
+	ImageURL    string `json:"imageUrl,omitempty"`
+}
+
+// handleGetPortfolioConfig returns the current portfolio configuration
+func (srv *Server) handleGetPortfolioConfig(c echo.Context) error {
+	// Ensure we have a valid token before making any API requests
+	// This is not currently used for portfolio config, but might be needed in the future
+	if err := srv.ensureValidToken(c); err != nil {
+		slog.Error("failed to ensure valid token", "error", err)
+		return echo.NewHTTPError(http.StatusInternalServerError, "Authentication error: "+err.Error())
 	}
 
-	// First acquire a read lock to check if refresh is needed
-	srv.authMutex.RLock()
-	if !srv.auth.RefreshAt.IsZero() && time.Now().Before(srv.auth.RefreshAt) {
-		srv.authMutex.RUnlock()
-		return nil
+	config := PortfolioConfig{
+		Enabled: srv.enablePortfolio,
 	}
-	srv.authMutex.RUnlock()
+	return c.JSON(http.StatusOK, config)
+}
 
-	// If we need to refresh, acquire write lock
-	srv.authMutex.Lock()
-	defer srv.authMutex.Unlock()
-
-	// Double-check if refresh is still needed after acquiring write lock
-	// This prevents multiple refreshes if another goroutine refreshed while we were waiting
-	if !srv.auth.RefreshAt.IsZero() && time.Now().Before(srv.auth.RefreshAt) {
-		return nil
+// handleGetPortfolio returns a user's portfolio data
+func (srv *Server) handleGetPortfolio(c echo.Context) error {
+	if !srv.enablePortfolio {
+		return echo.NewHTTPError(http.StatusNotFound, "portfolio feature is not enabled")
 	}
 
-	// If we don't have a token yet, create a new session
-	if srv.auth.Token == "" {
-		session, err := atproto.ServerCreateSession(c.Request().Context(), srv.xrpcc, &atproto.ServerCreateSession_Input{
-			Identifier: srv.auth.Handle,
-			Password:   srv.auth.Password,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to create session: %w", err)
-		}
-		srv.auth.Token = session.AccessJwt
-		srv.auth.RefreshAt = time.Now().Add(time.Hour * 23) // Refresh 1 hour before expiry
-		srv.xrpcc.Auth = &xrpc.AuthInfo{AccessJwt: session.AccessJwt}
-		return nil
+	// Get handle from URL param or hostname
+	handle := c.Param("handle")
+	if handle == "" {
+		handle = getHandleFromRequest(c)
 	}
 
-	// Refresh existing token
-	// Note: In a production environment, you might want to implement token refresh
-	// using the appropriate Bluesky API endpoint. For now, we just create a new session.
-	session, err := atproto.ServerCreateSession(c.Request().Context(), srv.xrpcc, &atproto.ServerCreateSession_Input{
-		Identifier: srv.auth.Handle,
-		Password:   srv.auth.Password,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to refresh session: %w", err)
+	// Validate handle
+	if err := srv.validateHandle(handle); err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "invalid handle")
 	}
 
-	srv.auth.Token = session.AccessJwt
-	srv.auth.RefreshAt = time.Now().Add(time.Hour * 23) // Refresh 1 hour before expiry
-	srv.xrpcc.Auth = &xrpc.AuthInfo{AccessJwt: session.AccessJwt}
-	return nil
+	// Ensure we have a valid token before making any API requests
+	// This is not currently used for portfolio data, but might be needed in the future
+	if err := srv.ensureValidToken(c); err != nil {
+		slog.Error("failed to ensure valid token", "error", err)
+		return echo.NewHTTPError(http.StatusInternalServerError, "Authentication error: "+err.Error())
+	}
+
+	// For now, return a placeholder portfolio
+	// In a real implementation, this would fetch from a database or other storage
+	portfolio := Portfolio{
+		Handle:      handle,
+		Description: "My portfolio of projects and contributions",
+		Projects: []Project{
+			{
+				Title:       "Example Project",
+				Description: "A sample project to demonstrate the portfolio feature",
+				URL:         "https://example.com/project",
+			},
+		},
+	}
+
+	return c.JSON(http.StatusOK, portfolio)
 }

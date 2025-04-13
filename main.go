@@ -131,6 +131,7 @@ func main() {
 	var pdsHost string
 	var pdsHandle string
 	var pdsPassword string
+	var enablePortfolio bool
 
 	// Parse command line flags
 	flag.StringVar(&bindAddr, "bind", ":8200", "address to bind server to")
@@ -139,6 +140,7 @@ func main() {
 	flag.StringVar(&pdsHost, "pds", "", "PDS host to connect to")
 	flag.StringVar(&pdsHandle, "pds-handle", "", "handle to authenticate with PDS")
 	flag.StringVar(&pdsPassword, "pds-password", "", "password to authenticate with PDS")
+	flag.BoolVar(&enablePortfolio, "portfolio", false, "enable portfolio feature")
 	flag.Parse()
 
 	// Override flags with environment variables if present
@@ -148,6 +150,9 @@ func main() {
 	pdsHost = getEnvOrFlag("ATHOME_PDS", pdsHost)
 	pdsHandle = getEnvOrFlag("ATHOME_PDS_HANDLE", pdsHandle)
 	pdsPassword = getEnvOrFlag("ATHOME_PDS_PASSWORD", pdsPassword)
+	if envPortfolio := os.Getenv("ATHOME_ENABLE_PORTFOLIO"); envPortfolio != "" {
+		enablePortfolio = strings.ToLower(envPortfolio) == "true" || envPortfolio == "1"
+	}
 
 	// Set up logging
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -197,32 +202,39 @@ func main() {
 		slog.Info("using AppView configuration", "host", appviewHost)
 	}
 
-	// Set up context with cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle shutdown signals
-	go func() {
-		quit := make(chan os.Signal, 1)
-		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-		<-quit
-		slog.Info("shutting down server...")
-		cancel()
-	}()
-
 	// Create directory service wrapper
 	dir := &defaultDirectory{
 		dir: identity.DefaultDirectory(),
 	}
 
-	// Run server
-	slog.Info("starting server",
-		"bind", bindAddr,
-		"host", xrpcc.Host,
-		"auth_enabled", auth != nil,
-	)
+	// Set up server
+	srv, err := setupServer(bindAddr, xrpcc, dir, validHandlesList, auth)
+	if err != nil {
+		slog.Error("failed to set up server", "error", err)
+		os.Exit(1)
+	}
 
-	if err := Run(ctx, bindAddr, xrpcc, dir, validHandlesList, auth); err != nil {
+	// Enable portfolio if configured
+	srv.enablePortfolio = enablePortfolio
+	if enablePortfolio {
+		slog.Info("portfolio feature enabled")
+	}
+
+	// Set up context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle shutdown signals
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+		slog.Info("shutting down server...")
+		cancel()
+	}()
+
+	// Start server
+	if err := startServer(ctx, srv, bindAddr); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
